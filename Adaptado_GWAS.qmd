@@ -1,0 +1,457 @@
+---
+title: "Adaptado_GWAS"
+format: html
+editor: visual
+---
+
+# Trabalho GWAS - Grupo 2
+
+## 1. Importar Pacotes
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r packages, include=FALSE, warning=FALSE,error=FALSE}
+library(tidyverse)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(ggpubr)
+library(shiny)
+library(rrBLUP)
+library(corrplot)
+library(DT)
+library(HardyWeinberg)
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+
+# No scentific notation
+options(scipen=999)
+
+```
+
+## 2. Importação, Limpeza e Padronização dos Dados
+
+### 2.1 Importação dos Dados
+
+```{r}
+
+load("groupo_2.RData")
+```
+
+### 2.2. Limpeza e Formatação
+
+#### Dataframe *Pheno*
+
+```{r}
+# 1. Renomear ID para GID e adicionar o "Ind" (= ao Geno)
+pheno <- pheno %>% 
+  rename(GID = ID) %>% 
+  mutate(GID = paste0("Ind", GID))
+
+# 2. Mover Disease para a última posição
+# Isto seleciona todas as colunas exceto Disease, e depois adiciona Disease no fim
+pheno <- pheno %>% select(-Disease, everything(), Disease)
+
+
+# pheno_clean <- pheno %>%
+#   # 1. Renomear ID para GID e adicionar o "Ind" (= ao Geno)
+#   rename(GID = ID) %>% 
+#   mutate(GID = paste0("Ind", GID)) %>%
+#   
+#   # 2. Valores < 0 viram NA
+#   mutate(Age = ifelse(Age < 0, NA, Age)) %>% 
+#   
+#   # 3. Remover doentes com NAs
+#   drop_na(Age, Sex, Smoker, Disease) %>%
+#   
+#   # 4. Mover Disease para a última posição
+#   # Isto seleciona todas as colunas exceto Disease, e depois adiciona Disease no fim
+#   select(-Disease, everything(), Disease)
+```
+
+#### Dataframe *Geno*
+
+```{r}
+# 1. Definir os IDs como nomes das linhas
+rownames(geno) <- geno$ID
+
+# 2. Remover a coluna ID original
+geno <- geno[, -which(colnames(geno) == "ID")]
+
+# 3. Recodificar Marcadores Génicos
+geno_mat <- as.matrix(geno)
+geno_mat <- 1 - geno_mat
+geno <- as.data.frame(geno_mat)
+
+```
+
+#### Dataframe *Map*
+
+```{r}
+colnames(map)[colnames(map) == "Marker"] <- "Markers"
+colnames(map)[colnames(map) == "Chromosome"] <- "chrom"
+colnames(map)[colnames(map) == "Locus"] <- "loc"
+
+```
+
+## 3. Análise Exploratória
+
+== Em construção ==
+
+Talvez uns gráficos de barras para variaveis categoricas, um histograma para variáveis continuas e um boxplot para ver outliers?
+
+No map ver quantos marcadores há em cada cromossoma?
+
+## 4. Filtragem de Genótipo
+
+```{r}
+
+filter_qc <- function(geno_matrix, max_missing_ind, max_missing_marker, max_het_ind) {
+  
+  # (a) Calcular missing data por MARCADOR 
+  marker_missing <- apply(geno_matrix, 2, function(x) {
+    sum(is.na(x)) / length(x)
+  })
+  
+  # (b) Calcular missing data por INDIVÍDUO 
+  ind_missing <- apply(geno_matrix, 1, function(x) {
+    sum(is.na(x)) / length(x)
+  })
+  
+  # (c) Calcular heterozigotia por INDIVÍDUO 
+  ind_het <- apply(geno_matrix, 1, function(x) {
+    valid_calls <- x[!is.na(x)] # Só contamos as leituras válidas para não enviesar com NAs
+    if(length(valid_calls) == 0) return(1) # Prevenção de erro: se a linha for toda NA
+    
+    sum(valid_calls == 0) / length(valid_calls)
+  })
+  
+  # --- APLICAR OS FILTROS ---
+  
+  # Quais linhas (indivíduos) vamos manter? Aqueles que cumprem AMBOS os critérios
+  keep_inds <- which(ind_missing < max_missing_ind & ind_het < max_het_ind)
+  
+  # Quais colunas (marcadores) vamos manter?
+  keep_markers <- which(marker_missing < max_missing_marker)
+  
+  # Sub-selecionar a matriz final (Linhas, Colunas)
+  geno_filtered <- geno_matrix[keep_inds, keep_markers]
+  
+  return(geno_filtered)
+}
+
+
+# --- ZONA DE INTEGRAÇÃO SHINY ---
+# Quando passares para o Shiny, estas 3 variáveis estáticas vão 
+# desaparecer e ser substituídas por algo como: input$slider_im, input$slider_mm, etc.
+# No servidor do Shiny, a chamada será reativa: reativo_geno() <- filter_qc(geno, input$slider_im, ...)
+
+thr_im <- 0.40  # Threshold (b): máx 40% NA por Indivíduo
+thr_mm <- 0.60  # Threshold (a): máx 60% NA por Marcador
+thr_het <- 0.75 # Threshold (c): máx 75% Heterozigotia por Indivíduo (ex: para evitar contaminações)
+
+# Executar a função:
+geno.filtered <- filter_qc(
+  geno_matrix = geno,
+  max_missing_ind = thr_im,
+  max_missing_marker = thr_mm,
+  max_het_ind = thr_het
+)
+
+# Verificar o resultado na consola
+print(paste("Dimensão original:", dim(geno)[1], "indivíduos,", dim(geno)[2], "marcadores"))
+print(paste("Dimensão filtrada:", dim(geno.filtered)[1], "indivíduos,", dim(geno.filtered)[2], "marcadores"))
+```
+
+## 5. Equilíbrio de Hardy-Weinberg
+
+#### A. Teste Estatístico
+
+```{r}
+
+# Função para aplicar a função um único marcador
+calc_hw_pvalue <- function(snp) {
+  snp <- snp[!is.na(snp)] # Não ler os NA's
+  if(length(snp) == 0) return(NA) # Porque para o caso de ser só um Marker com NAs, não corre
+  
+  # Contar genótipos (assumindo a formatação -1, 0, 1)
+  AA <- sum(snp == -1)
+  AR <- sum(snp == 0)
+  RR <- sum(snp == 1)
+
+  # Está-se a aplicar o Teste Exato de Fisher em vez do Qui-Quadrado
+  hw_res <- HWExact(c(AA = AA, AB = AR, BB = RR), verbose = FALSE)
+  return(hw_res$pval)
+}
+
+
+# Aplicar a toda a matriz de marcadores
+hw_pvalues <- apply(geno.filtered, 2, calc_hw_pvalue)
+
+# Filtrar a matriz (ex: manter os que têm p-value >= 1e-5)
+geno.hwe <- geno.filtered[, which(hw_pvalues >= 1e-5)]
+# PARA O SHINY, AQUI PODE SER
+# geno.hwe <- geno.filtered[, which(hw_pvalues >= input$hwe_cutoff)]
+# 
+# Poderias dar ao utilizador as seguintes opções na App:
+# "Lax (Pouco rigoroso)": $10^{-3}$ (0.001)
+# "Standard GWAS": $10^{-5}$ (0.00001) - Pode ser o valor por defeito.
+# "Conservative": $10^{-6}$ (0.000001)
+# "Bonferroni": Fazer a conta dinâmica de $0.05 / \text{número de marcadores}$.
+
+```
+
+#### B. Gráfico Ternário
+
+```{r}
+# Criar a matriz de contagens para o gráfico
+hw_counts_matrix <- t(apply(geno.filtered, 2, function(snp) {
+  c(AA = sum(snp == -1, na.rm=TRUE), 
+    AB = sum(snp == 0, na.rm=TRUE), 
+    BB = sum(snp == 1, na.rm=TRUE))
+}))
+
+# Gerar o gráfico
+HWTernaryPlot(hw_counts_matrix, 
+              region = 1, 
+              hwcurve = TRUE, 
+              vbounds = TRUE, 
+              alpha = 0.05,
+              vertexlab = c("AA", "AR", "RR"))
+
+# Há muito código que pode ser feito aqui quando for de facto um Shiny App para editar este gráfico!
+```
+
+## 6. Imputação, MAF e Matriz Kinship
+
+```{r}
+# Usamos a matriz "geno.hwe" que já passou pelos filtros de QC e Hardy-Weinberg
+# O parâmetro min.MAF pode ser um slider no Shiny: Permitir variar entre 0.01 (mais marcadores) e 0.10 (apenas marcadores muito frequentes)
+
+Imputation <- A.mat(
+  geno.hwe,
+  impute.method = "mean", # Opções SHINY: "mean" (rápido) ou "EM" (mais preciso, mas lento)
+  return.imputed = TRUE,
+  min.MAF = 0.05          # Filtra marcadores com frequência do alelo minor < 5%
+)
+
+# 1. Matriz Kinship (K): Representa a relação genética entre indivíduos
+K.mat <- Imputation$A 
+
+# 2. Matriz Genotípica Final: Agora sem NA's e com os filtros todos aplicados
+geno.gwas <- Imputation$imputed 
+
+# Mostra as primeiras 6 linhas e colunas da matriz de parentesco
+# No Shiny, isto pode ser uma tabela interativa ou um heatmap
+datatable(K.mat[1:6, 1:6], caption = "Amostra da Matriz Kinship (K)")
+```
+
+## 7. Estrutura Populacional
+
+A análise de estrutura populacional é crucial para garantir que a nossa amostra não possui enviesamentos causados por subpopulações ou relações familiares fortes, o que poderia gerar falsos positivos no GWAS.
+
+### 7.1. Análise de Componentes Principais (PCA) e Variância
+
+Primeiro, calculamos a variação global da amostra através de uma Decomposição em Valores Singulares (SVD) e avaliamos quanta informação cada Componente Principal retém.
+
+```{r}
+# 1. Centrar os dados genotípicos (Essencial para SVD)
+geno.scale <- scale(geno.gwas, center = TRUE, scale = FALSE) 
+
+# 2. Executar SVD
+svdgeno <- svd(geno.scale)
+
+# 3. Calcular os scores dos Componentes Principais (PCs)
+PCA_scores <- geno.scale %*% svdgeno$v
+colnames(PCA_scores) <- paste0("PC", 1:ncol(PCA_scores))
+
+# 4. Calcular Variância Explicada e Cumulativa
+var_explicada <- (svdgeno$d^2 / sum(svdgeno$d^2)) * 100
+var_cumulativa <- cumsum(var_explicada)
+```
+
+```{r}
+# --- SCREEPLOT ---
+# SHINY WIDGETS (Inputs do utilizador para o gráfico)
+n_pcs <- 15          # Ex: sliderInput("n_pcs", ...)
+linha_corte <- 10    # Ex: numericInput("linha_corte", ...)
+
+# Preparar dados limitando de forma segura ao máximo de PCs ou 50
+max_pcs_to_show <- min(50, length(var_explicada))
+df_scree <- data.frame(
+  PC = 1:max_pcs_to_show,
+  Variancia = var_explicada[1:max_pcs_to_show],
+  Cumulativa = var_cumulativa[1:max_pcs_to_show]
+)
+
+df_plot <- df_scree[1:n_pcs, ]
+max_cumulativa <- max(df_plot$Cumulativa)
+
+# Gerar Gráfico
+p_scree <- ggplot(df_plot, aes(x = PC)) +
+  geom_bar(aes(y = Variancia), stat = "identity", fill = "gold4", alpha = 0.7) +
+  geom_line(aes(y = Cumulativa, group = 1), color = "darkred", linewidth = 1) +
+  geom_point(aes(y = Cumulativa), color = "darkred") +
+  labs(title = paste("Screeplot: Variância dos primeiros", n_pcs, "PCs"),
+       subtitle = "Barras: Variância por PC | Linha: Variância Total Acumulada",
+       x = "Componentes Principais (PCAs)", y = "% de Variância Explicada") +
+  theme_minimal()
+
+# Tem que se adicionar no eixo do x debaixo de cada coluna o número certinho de cada pca e não ser só a saltitar
+
+# Lógica para não esmagar o eixo Y com a linha de corte
+if(linha_corte <= (max_cumulativa * 1.5)) {
+  p_scree <- p_scree + geom_hline(yintercept = linha_corte, linetype = "dashed", color = "grey40")
+} else {
+  p_scree <- p_scree + labs(caption = paste("Nota: A linha de corte de", linha_corte, "% está fora do limite do eixo Y."))
+}
+
+print(p_scree)
+
+```
+
+### 7.2. Clustering Hierárquico e Dendrograma
+
+Para complementar o PCA, calculamos as distâncias genéticas emparelhadas e construímos um dendrograma para identificar a formação natural de clusters.
+
+```{r}
+# 1. Distância e Agrupamento
+# SHINY WIDGETS: selectInput para os métodos
+metodo_dist <- "euclidean" # No Shiny: input$dist_method => selectInput("dist_method", "Método de Distância:", choices = c("euclidean", "manhattan"))
+d <- dist(geno.gwas, method = metodo_dist) 
+
+metodo_linkage <- "ward.D2" # No Shiny: input$linkage => selectInput("linkage", "Algoritmo de Agrupamento:", choices = c("ward.D2", "complete", "average"))
+fit  <- hclust(d, method = metodo_linkage) # CORRIGIDO: usa a variável 'd'
+
+# 2. Definição do número ótimo de clusters
+# SHINY WIDGET: sliderInput("k_opt", "Número de Clusters:", min = 2, max = 10, value = 2)
+k_opt <- 2    
+groups <- cutree(fit, k = k_opt)
+t_clust <- table(groups)
+
+# --- DENDROGRAMA ---
+par(mar = c(3,4,3,1))
+plot(fit, labels = FALSE, hang = -1,
+     main = paste("Dendrograma Hierárquico (k =", k_opt, ")"),
+     xlab = "Indivíduos", sub = "", 
+     ylab = paste("Distância", tools::toTitleCase(metodo_dist))) # Para se adaptar ao método selecionado
+
+# Desenhar caixas à volta dos clusters selecionados
+rect.hclust(fit, k = k_opt, 
+            border = c("#2c7bb6","#d7191c","#1a9641","purple","orange")[1:k_opt])
+
+# INTERPRETAÇÃO DO DENDROGRAMA:
+# 1. Estrutura em "Pente": Os ramos unem-se quase todos à mesma altura e muito perto do topo (Distância ~116 => Cada caixinha preta é um indivíduo).
+#    Isto indica uma elevada HOMOGENEIDADE GENÉTICA. Não existem "ilhas" ou grupos isolados.
+# 2. Ausência de Estrutura Profunda: Se houvesse subpopulações (ex: etnias diferentes), veríamos 
+#    ramos a separar-se logo na base (alturas baixas). Aqui, todos parecem pertencer à mesma "sopa" genética.
+# 3. Conclusão: A amostra é segura para GWAS, pois o risco de falsos positivos por 
+#    estratificação populacional é baixo.
+
+
+# O k (número de clusters) é a tua forma de dizer ao modelo matemático: "Olha para estes dados com este nível de detalhe".
+#  - Se o Dendrograma tivesse ramos muito separados: Serias "obrigado" a escolher um $k$ que respeitasse essas divisões naturais (ex: se visses 3 grandes grupos, usarias $k=3$).
+#  - No nosso caso (População Homogénea): A escolha de $k=2$ é uma estratégia de precaução. Como não há divisões óbvias, escolhemos um número baixo ($k=2$) apenas para capturar e "limpar" as diferenças genéticas mais subtis que possam existir entre os dois lados do "pente".
+
+```
+
+### 7.3. Integração Genótipo-Fenótipo
+
+Finalmente, projetamos os clusters validados no espaço bidimensional do PCA e cruzamos essa informação com o fenótipo principal (Doença) para garantir a ausência de enviesamentos estruturais severos.
+
+```{r}
+# 1. Preparar dataframe final
+# ---------------------------------------------------------
+# WIDGETS A CRIAR NA UI DO SHINY: 
+# numericInput("pc_x", "Eixo X (PC):", value = 1, min = 1) 
+# numericInput("pc_y", "Eixo Y (PC):", value = 2, min = 1)
+# ---------------------------------------------------------
+
+# ---> NO SHINY: Substituir o [1] e [2] por [input$pc_x] e [input$pc_y]
+PCA_x_pct <- round(var_explicada[1], 2) 
+PCA_y_pct <- round(var_explicada[2], 2) 
+
+pca_df <- data.frame(
+  # ---> NO SHINY: 
+  # 1. Mudar o nome das variáveis para EixoX e EixoY
+  # 2. Substituir o [, 1] por [, input$pc_x]
+  PC1 = PCA_scores[, 1], 
+  PC2 = PCA_scores[, 2], 
+  Cluster = factor(groups),
+  Disease = factor(pheno_clean$Disease, labels = c("Sem doença", "Com doença"))
+)
+# AQUI PODE NÃO SER O PHENO_CLEAN MAS SIM O PHENO
+
+# 2. Criar os nomes para a legenda (ex: "Cluster 1 (n = 80)")
+contagem <- table(groups)
+# ---> NO SHINY: O 'k_opt' virá do teu sliderInput (ex: input$k_opt) criado no bloco anterior
+nomes_legenda <- paste0("Cluster ", 1:k_opt, " (n = ", contagem, ")")
+
+# --- GRÁFICO 1: PCA Colorido por Clusters ---
+# ---> NO SHINY: Substituir x = PC1, y = PC2 por x = EixoX, y = EixoY
+p_clust <- ggplot(pca_df, aes(x = PC1, y = PC2, col = Cluster)) +
+  geom_point(alpha = 0.75, size = 2.2) +
+  scale_color_manual(values = c("#2c7bb6","#d7191c","#1a9641", "purple","orange")[1:k_opt],
+                     labels = nomes_legenda, 
+                     name = "Grupos Genéticos") +
+  # ---> NO SHINY: O texto "PC1" tem de ser dinâmico (ex: paste0("PC", input$pc_x, ...))
+  # E o "Ward.D2" no título deve refletir o input$linkage escolhido pelo utilizador
+  labs(x = paste0("PC1 (", PCA_x_pct, "%)"),
+       y = paste0("PC2 (", PCA_y_pct, "%)"),
+       title = paste("ACP —", k_opt, "Clusters (Ward.D2)")) +
+  theme_minimal()
+
+# --- GRÁFICO 2: Distribuição da Doença por Cluster ---
+p_clust_dis <- ggplot(pca_df, aes(x = Cluster, fill = Disease)) +
+  geom_bar(position = "fill", alpha = 0.85) +
+  scale_y_continuous(labels = scales::percent) +
+  # ---> NO SHINY: Opcional, mas podes dar ao utilizador um selectInput para 
+  # escolher colorir pela "Disease" ou pelo "Sex", mudando o argumento fill = input$variavel_clinica
+  scale_fill_manual(values = c("#2c7bb6","#d7191c"), name = "Estado") +
+  labs(title = "Distribuição da Doença por Cluster",
+       x = "Cluster Genético", y = "Proporção") +
+  theme_minimal()
+
+# Exibir lado a lado
+ggarrange(p_clust, p_clust_dis, ncol = 2)
+```
+
+## 8. Match Phenotypes and Genotypes
+
+### 8.1. Preparação do Fenótipo e Covavariáveis
+
+```{r}
+
+# 1. Filtrar o fenótipo para conter apenas indivíduos com genótipo disponível
+pheno_final = pheno_clean[pheno_clean$GID %in% rownames(geno.gwas), ]
+
+# 2. Sincronizar os níveis do ID (GID) para garantir que a ordem é idêntica entre Pheno e Geno
+pheno_final$GID <- factor(as.character(pheno_final$GID), 
+                          levels = rownames(geno.gwas)) 
+
+# 3. Ordenar formalmente a tabela de fenótipos pela ordem do genótipo
+pheno_final <- pheno_final[order(pheno_final$GID), ] 
+
+# 4. Criação da Matriz
+X <- model.matrix(~-1 + Sex + Smoker, data = pheno_final) #one-hot encoding => Coloquei o Sexo mesmo só tendo 2 classes
+
+# 5. Criar o dataframe final exigido pelo pacote rrBLUP
+# Estrutura obrigatória: ID | Efeitos Fixos (Covariáveis) | Fenótipo Alvo
+pheno.gwas <- data.frame(GID = pheno_final$GID,
+                         X,
+                         Disease = pheno_final$Disease
+                         )
+# Visualizar a tabela final pronta para o modelo
+datatable(pheno.gwas, caption = "Tabela de Fenótipos Final (Alinhada e Codificada)")
+```
+
+## 9. Perform GWAS function
+
+== Em Construção ==
+
+## 10. Manhattan and QQ Plots
+
+== Em Construção ==
